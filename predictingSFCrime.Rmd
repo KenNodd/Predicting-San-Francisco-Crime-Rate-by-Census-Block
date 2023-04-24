@@ -1,0 +1,547 @@
+---
+title: "Predicting San Francisco Crime Rate by Census Block"
+author: "Kenneth Noddings"
+date: "2023-04-23"
+output:
+  pdf_document: default
+  html_document: default
+  
+---
+
+
+```{r, include=FALSE}
+#------------------------Importing and Cleaning Data----------------------------#
+library(tidyverse)
+library(tigris)
+library(sf)
+library(plyr)
+library(elevatr)
+library(rgdal)
+library(spdep)
+library(geosphere)
+
+#these libraries are also called in their own code subsections
+# library(modelr)
+# library(gbm)
+# library(rpart)
+# library(rpart.plot)
+# library(rsample) 
+# library(randomForest)
+
+#---------------------------------Importing-------------------------------------#
+#These first csv files were sourced from the dataSF website
+
+#I used DataSf's build in filtering tool to only select for property crimes
+#(Catagory == "Arson", "Burglary", "Vandalism", "Motor Vehicle Theft")
+#because the full dataset was extremely large
+crimeData <- read.csv("SFIncidentReports2018.csv")
+#Incident reports for all crimes between 2003 and 2018
+crimeData2 <- read.csv("SFIncidentReportsPre2018.csv")
+
+#dataSf Muni Stops; bus stop location
+busStops <- read.csv("Muni_Stops.csv")
+
+#dataSf police stations (2011) (last updated 2019); police station locations
+policeStation <- read.csv("Police_Stations.csv")
+
+#dataSf tax assessor property values (each row is one "property")
+#(e.g: a single apartment complex would have one row)
+#I pre-sorted the raw data from the website to only include entries from 2017 
+#onward, because the original data was also extremely large
+assHousing <- read.csv("assHousing2017Up.csv")
+
+#This file was sourced from the american community survey website
+#(which is a branch of the census)
+#estimated median housing prices (per census block group)
+priceDataGroup <- read.csv("housingPrice.csv")
+
+#---------------------------General cleaning------------------------------------#
+
+crimeData2 <- crimeData2 %>%
+  filter(Category == "ARSON" | Category == "VEHICLE THEFT"
+         | Category == "TRESPASS" | Category == "BURGLARY" | Category == "VANDALISM")
+
+crimeData2 <- crimeData2 %>%
+  mutate("Longitude" = X, "Latitude" = Y)
+crimeData2 <- crimeData2 %>%  
+  select(!(Y))
+
+crimeData <- rbind.fill(crimeData, crimeData2)
+
+crimeData <- crimeData %>%
+  filter(!(is.na(Latitude)))%>%
+  mutate("number" = NA)
+
+#Import tigris shape files for census blocks in San Francisco
+blocks <- blocks(state = "California", county = "075")
+
+blocks <- blocks %>%
+  mutate("Latitude" = INTPTLAT20, "Longitude" = INTPTLON20) %>%
+  select(!(INTPTLAT20)) %>%
+  select(!(INTPTLON20))
+
+blocks <- blocks %>%
+  mutate("Latitude" = as.numeric(Latitude), "Longitude" = as.numeric(Longitude))
+
+blocks <- blocks %>%
+  mutate("area" = st_area(blocks))
+
+#figure out which block each crime happened in and assign the total
+#number for each block, "count"
+crimeData_sf = st_as_sf(crimeData, coords = c("Longitude", "Latitude"), 
+                 crs = "NAD83")
+
+crimeDataBurgal <- crimeData_sf %>%
+  filter(Category == "BURGLARY")
+
+blocks$count <- lengths(st_intersects(blocks, crimeData_sf))
+blocks$countBurgal <- lengths(st_intersects(blocks, crimeDataBurgal))
+
+#------------------------Creating a Measure of Steepness------------------------#
+#classify street grade for each block by finding elevation at lat/lon and comparing to
+#elevation of neighboring blocks. High delta/distance between coordinates = steep street
+#this will take some time
+
+#first we find the elevation of each block (downloaded from amazon web services)
+temp_df <- as.data.frame(blocks) %>%
+  select("Longitude", "Latitude")%>% 
+  transmute("x" = Longitude, "y" = Latitude)
+df_elev_epqs <- get_elev_point(temp_df, prj = "EPSG:4326", src = "aws", z = 14)
+
+elev <- as.data.frame(df_elev_epqs)
+elev <- elev %>%
+  mutate("latitude" = coords.x2, "longitude" = coords.x1) %>%
+  select(latitude, longitude, elevation, elev_units)
+
+elevBlocks <- cbind(elev, blocks) %>%
+  select(!(Latitude)) %>%
+  select(!(Longitude))
+elevBlocks <- st_as_sf(elevBlocks)
+
+rm(temp_df)
+rm(df_elev_epqs)
+rm(elev)
+
+#now we build a list of lists that stores the index of every block that a given
+#block touches (it's neighbors)
+touching <- poly2nb(elevBlocks)
+
+adjBlocks <- elevBlocks %>%
+  select(GEOID20, latitude, longitude, elevation, ALAND20, count, countBurgal) %>%
+  mutate("neighbors" = NA)
+
+adjBlocks <- adjBlocks %>%
+  mutate("groupGEOID" = substr(GEOID20, 1, 12))
+
+#Finally we loop through each of those lists to compare the rise/run of elevation
+#(in meters) between neighbors. This is stored as a minimum, mean, and maximum
+adjBlocks <- adjBlocks %>%
+  mutate("maxSteepness" = NA, "minSteepness" = NA, "meanSteepness" = NA)
+for (i in 1:length(adjBlocks$maxSteepness)) {
+  max = NA
+  min = NA
+  mean = NA
+  
+  for (j_1 in 1:length(touching[[i]])) {
+    tempDist1 = abs((adjBlocks$elevation[i] - adjBlocks$elevation[touching[[i]][j_1]])/
+                      distm(c(adjBlocks$longitude[i], adjBlocks$latitude[i]),
+                            c(adjBlocks$longitude[touching[[i]][j_1]], adjBlocks$latitude[touching[[i]][j_1]]),
+                            fun = distHaversine))
+    if (is.na(max)) {
+      max = tempDist1
+    } else if (max < tempDist1){
+      max = tempDist1
+    }
+  
+  }
+  tempDist2 = 0
+  for (j_2 in 1:length(touching[[i]])) {
+    tempDist2 = tempDist2 + abs((adjBlocks$elevation[i] - adjBlocks$elevation[touching[[i]][j_2]])/
+                            distm(c(adjBlocks$longitude[i], adjBlocks$latitude[i]),
+                            c(adjBlocks$longitude[touching[[i]][j_2]], adjBlocks$latitude[touching[[i]][j_2]]),
+                            fun = distHaversine))
+    
+  }
+  mean = tempDist2/length(touching[[i]])
+  for (j_3 in 1:length(touching[[i]])) {
+    tempDist3 = abs((adjBlocks$elevation[i] - adjBlocks$elevation[touching[[i]][j_3]])/
+                      distm(c(adjBlocks$longitude[i], adjBlocks$latitude[i]),
+                            c(adjBlocks$longitude[touching[[i]][j_3]], adjBlocks$latitude[touching[[i]][j_3]]),
+                            fun = distHaversine))
+    if (is.na(min)) {
+      min = tempDist3
+    } else if (min > tempDist3){
+      min = tempDist3
+    }
+    
+  }
+  
+  adjBlocks$maxSteepness[i] = max
+  adjBlocks$minSteepness[i] = min
+  adjBlocks$meanSteepness[i] = mean
+}
+rm(i)
+rm(j_1)
+rm(j_2)
+rm(j_3)
+rm(tempDist3)
+rm(tempDist2)
+rm(tempDist1)
+rm(max)
+rm(mean)
+rm(min)
+
+#---------------------Creating a Measure of Housing Prices----------------------#
+
+#census measure
+priceDataGroup <- priceDataGroup[-1,]
+
+priceDataGroup <- priceDataGroup %>%
+  transmute("GEOID" = GEO_ID, "estimate" = B25077_001E, "censusErr" = B25077_001M)
+
+priceDataGroup <- priceDataGroup %>%
+  mutate("groupGEOID" = substr(GEOID, 10, 24)) %>%
+  select(!(GEOID))
+
+adjBlocks <- merge(adjBlocks, priceDataGroup)
+
+#clean and transmute to numeric
+for(i in 1:length(adjBlocks$estimate)) {
+  if (adjBlocks$estimate[i] == "-") {
+    adjBlocks$estimate[i] = NA
+  } else if (adjBlocks$estimate[i] == "2,000,000+") {
+    adjBlocks$estimate[i] = 2000001
+  } else {
+    adjBlocks$estimate[i] = as.numeric(adjBlocks$estimate[i])
+  }
+}
+rm(i)
+adjBlocks <- adjBlocks %>%
+  mutate(estimate = as.numeric(estimate))
+
+#Property Tax Assessor Measure
+#In Short: assign each assessed property to a census block, then find the
+#average of both the exclusively "land" valuations and the total valuations
+#Property size is corrected for to turn this into a per foot^2 measure.
+assHousing <- assHousing %>%
+  filter(Closed.Roll.Year >= 2017)
+
+assHousing <- assHousing %>%
+  filter(the_geom != "")
+
+adjBlocks <- adjBlocks %>%
+  filter(ALAND20 != 0)
+
+assHousing$longitude <- sapply(strsplit(assHousing$the_geom, " "), "[", 2)
+assHousing$latitude <- sapply(strsplit(assHousing$the_geom, " "), "[", 3)
+assHousing$longitude <- substring(assHousing$longitude, 2)
+assHousing$latitude <- substring(assHousing$latitude, 1, nchar(assHousing$latitude) - 1)
+
+assHousing <- st_as_sf(assHousing, coords = c("longitude", "latitude"), crs = "NAD83")
+withinPrices <- st_intersects(adjBlocks, assHousing)
+
+adjBlocks$meanLandValue <- NA
+for (i in 1:length(adjBlocks$meanLandValue)) {
+  value = 0
+  for (j in 1:length(withinPrices[[i]])) {
+    if (length(withinPrices[[i]]) > 0) {
+      if (assHousing$Property.Area[withinPrices[[i]][j]] > 0) {
+        value = value + (assHousing$Assessed.Land.Value[withinPrices[[i]][j]]/assHousing$Property.Area[withinPrices[[i]][j]])
+      }
+    }
+  }
+  if (length(withinPrices[[i]]) > 0) {
+    adjBlocks$meanLandValue[i] = value/length(withinPrices[[i]])
+  } else {
+    adjBlocks$meanLandValue[i] = NA
+  }
+  
+}
+rm(value)
+rm(i)
+rm(j)
+
+adjBlocks$meanTotalValue <- NA
+for (i in 1:length(adjBlocks$meanLandValue)) {
+  value = 0
+  for (j in 1:length(withinPrices[[i]])) {
+    
+    if (length(withinPrices[[i]]) > 0) {
+      if (assHousing$Property.Area[withinPrices[[i]][j]] > 0) {
+        if (assHousing$Use.Code[withinPrices[[i]][j]] == "SRES" || assHousing$Use.Code[withinPrices[[i]][j]] == "MRES") {
+          value = value + ((assHousing$Assessed.Land.Value[withinPrices[[i]][j]]+
+                              assHousing$Assessed.Fixtures.Value[withinPrices[[i]][j]]+
+                              assHousing$Assessed.Improvement.Value[withinPrices[[i]][j]]+
+                              assHousing$Assessed.Personal.Property.Value[withinPrices[[i]][j]])
+                           /assHousing$Property.Area[withinPrices[[i]][j]])
+        }
+      }
+    }
+    
+  }
+  if (length(withinPrices[[i]]) > 0) {
+    adjBlocks$meanTotalValue[i] = value/length(withinPrices[[i]])
+  } else {
+    adjBlocks$meanTotalValue[i] = NA
+  }
+  
+}
+rm(value)
+rm(i)
+rm(j)
+
+#------------Find the distance to the closest bus stop for each block-----------#
+
+
+
+df1 <- as.data.frame(adjBlocks) %>%
+  select(latitude, longitude)
+df2 <- busStops %>%
+  select(LATITUDE, LONGITUDE)
+adjBlocks[ , c(length(adjBlocks) + 1,length(adjBlocks) + 2)] <- as.data.frame(RANN::nn2(df2[,c(1,2)],df1[,c(1,2)], k=1))
+rm(df1)
+rm(df2)
+adjBlocks <- adjBlocks %>%
+  select(!(nn.idx))%>%
+  mutate(busDist = nn.dists, nn.dists = NULL)
+
+busStops <- busStops %>%
+  mutate(LATITUDE = as.numeric(LATITUDE), LONGITUDE = as.numeric(LONGITUDE))
+
+#----------Find the distance to the closest police station for each block-------#
+
+
+policeStation$longitude <- sapply(strsplit(policeStation$Location, ","), "[", 2)
+policeStation$latitude <- sapply(strsplit(policeStation$Location, ","), "[", 1)
+policeStation$latitude <- substr(policeStation$latitude, 2, nchar(policeStation$latitude))
+policeStation$longitude <- substr(policeStation$longitude, 1, nchar(policeStation$longitude) - 1)
+
+df1 <- as.data.frame(adjBlocks) %>%
+  select(latitude, longitude)
+df2 <- policeStation %>%
+  select(latitude, longitude)
+adjBlocks[ , c(length(adjBlocks) + 1,length(adjBlocks) + 2)] <- as.data.frame(RANN::nn2(df2[,c(1,2)],df1[,c(1,2)], k=1))
+rm(df1)
+rm(df2)
+adjBlocks <- adjBlocks %>%
+  select(!(nn.idx))%>%
+  mutate(policeDist = nn.dists, nn.dists = NULL)
+
+policeStation <- policeStation %>%
+  mutate(latitude = as.numeric(latitude), longitude = as.numeric(longitude))
+
+#-------------------------------model building----------------------------------#
+library(modelr)
+library(gbm)
+library(rpart)
+library(rpart.plot)
+library(rsample) 
+library(randomForest)
+
+#fit boost with max 500 trees
+boostWithCoord = gbm(count/ALAND20~longitude + latitude + policeDist + busDist +
+              elevation + maxSteepness + meanSteepness + minSteepness + 
+              estimate + meanLandValue + meanTotalValue, data=adjBlocks, 
+            interaction.depth=12, n.trees=500, shrinkage=.01, cv.folds = 4)
+#425 trees optimal, out-of-sample RMSE using 4 folds = 3.044968e-05
+#(compared to average count/ALAND20 = 0.0055 (~0.5% error))
+
+boost = gbm(count/ALAND20~ policeDist + busDist +
+                    elevation + maxSteepness + meanSteepness + minSteepness + 
+                    estimate + meanLandValue + meanTotalValue, data=adjBlocks, 
+                  interaction.depth=12, n.trees=500, shrinkage=.01, cv.folds = 4)
+#474 trees optimal, out-of-sample RMSE using 4 folds = 3.546524e-05
+
+boostNoPolice = gbm(count/ALAND20~   busDist +
+                    elevation + maxSteepness + meanSteepness + minSteepness + 
+                    estimate + meanLandValue + meanTotalValue, data=adjBlocks, 
+                  interaction.depth=12, n.trees=500, shrinkage=.01, cv.folds = 4)
+#496 trees optimal, RMSE = 3.959318e-05
+
+boostNoBus = gbm(count/ALAND20~ policeDist  +
+                    elevation + maxSteepness + meanSteepness + minSteepness + 
+                    estimate + meanLandValue + meanTotalValue, data=adjBlocks, 
+                  interaction.depth=12, n.trees=500, shrinkage=.01, cv.folds = 4)
+#425 trees, RMSE = 3.775293e-05
+
+boostNoElev = gbm(count/ALAND20~ policeDist + busDist +
+                 maxSteepness + meanSteepness + minSteepness + 
+                estimate + meanLandValue + meanTotalValue, data=adjBlocks, 
+              interaction.depth=12, n.trees=500, shrinkage=.01, cv.folds = 4)
+#460, 3.854513e-05
+
+boostNoElevOrGrade = gbm(count/ALAND20~ policeDist + busDist +
+                estimate + meanLandValue + meanTotalValue, data=adjBlocks, 
+              interaction.depth=12, n.trees=500, shrinkage=.01, cv.folds = 4)
+#288, 3.958087e-05
+
+boostNoPrice = gbm(count/ALAND20~ policeDist + busDist +
+                elevation + maxSteepness + meanSteepness + minSteepness, data=adjBlocks, 
+              interaction.depth=12, n.trees=500, shrinkage=.01, cv.folds = 4)
+#383, 4.014252e-05
+
+LM <- lm(data = adjBlocks, count/ALAND20 ~ policeDist + elevation + meanLandValue + busDist + estimate + meanTotalValue + maxSteepness + minSteepness + meanSteepness)
+
+#add predictions to data
+adjBlocks <- adjBlocks %>%
+  mutate(pred = predict(boost, n.trees = 474),
+         predWithCoord = predict(boostWithCoord, n.trees = 425),
+         predNoPolice = predict(boostNoPolice, n.trees = 496),
+         predNoBus = predict(boostNoBus, n.trees = 425),
+         predNoElev = predict(boostNoElev, n.trees = 460),
+         predNoElevOrGrade = predict(boostNoElevOrGrade, n.trees = 288),
+         predNoPrice = predict(boostNoPrice, n.trees = 383),
+         predErr = abs(pred - count/ALAND20),
+         predWithCoordErr = abs(predWithCoord - count/ALAND20),
+         coordDiff = abs(pred - predWithCoord),
+         policeDiff = abs(pred - predNoPolice),
+         busDiff = abs(pred - predNoBus),
+         elevDiff = abs(pred - predNoElev),
+         elev_gradeDiff = abs(pred - predNoElevOrGrade),
+         priceDiff = abs(pred - predNoPrice))
+
+
+# rm(boost)
+# rm(boostWithCoord)
+# rm(boostNoPolice)
+# rm(boostNoBus)
+# rm(boostNoElev)
+# rm(boostNoElevOrGrade)
+# rm(boostNoPrice)
+
+```
+
+## Abstract
+
+  I attempted to build a model that would predict the property-crime rate by census block in the San Francisco county area using a small number of explanatory data points (property value, proximity to police stations and bus stops, elevation, and approximate street grade) as well as data on crime incidents in San Francisco over the past 20 years. My personal area of interest was in finding how powerful of a predictor street grade is of property crime rates; the hypothesis being that steep streets may causally impact crime by disincentivizing travel up and down them (this would follow general literature on urban crime that suggests there is a causal impact from neighborhood "permeability" on crime rates). I used a gradient boosting machine (gbm) to build this model and found an out-of-sample RMSE of 0.0026/20, which compares to true average property-crime rate of 0.0055/20 crimes per meter squared of area per year (this translates to an average error of 47%), or to the RMSE of a linear model, initialized using the same explanatory variables, of 0.0047/20 (this translates to an average error of 85%). In the GBM model, I found that property valuations had the highest predictive power on property crime rate, followed by police station proximity, absolute elevation, and bus stop proximity. The predictive power of my more direct attempts to measure street grade were all rather low.
+  
+## Introduction
+
+  A recent trip to visit my sister in San Francisco, who happens to live on one of the cities ubiquitous steep streets, spawned a passing remark that caught my interest: "The steeper streets have less crime." Certainly the claim seems sensible: criminals, just like anyone else, don't enjoy walking up hill, and so, all else being equal, they should prefer to choose a street that is flat compared to one that is not. My decision to pursue this hypothesis ultimately lead my to the more general project of modeling crime rates in San Francisco outlined in this report. Here I see what the best model of crime rates I can build is using only a few key data points: property value, proximity to the nearest police station, proximity to the nearest bus stop, absolute elevation, and approximate street grade. These metrics are extremely easy to measure or estimate, so an accurate model built off of them could be very valuable at approximating unknown property crime rates--a variable of interest who's importance need no further explanation.
+  
+## Methods
+
+  As mentioned previously, I have used several sets of data in the making of this report, the majority of which were sourced from the "DataSF" website, which holds a large collection of interesting data tables relating to the county of San Francisco. I originally sourced data on police station and bus stop locations, elevation (from amazon web services), median housing values (from the American Community Survey/Census), and property crime incident reports from 2003 to present (see figure 1 below for the map of true incidence of crime over this period). However, I was unsatisfied with the median housing data that I retrieved from the census, as it was summarized by block group rather than block ("block group" is one step larger than "block" in the census designation scheme), and a fair number of areas in San Francisco had no reported values (likely because of a lack of residential property in those block groups) (see figure a.1 in the appendix).
+  In order to come up with a more accurate measure of property value by block, I additionally sourced a data set from DataSF comprised of the property values of individual properties (a single apartment complex, for instance) as assessed for the purposes of property taxation. These valuations were further broken down into categories, including "land" valuation. Using this data, I was able to assign a separate average measure of both individual land value, and total (including improvements etc) property value for almost every census block in the county (see figures a.2, and a.3 in the appendix).
+  I further engineered an approximation for street grade using elevation data. To do this, I compared the elevation of a given block to each of its neighbors. I then recorded the minimum, average, and maximum of these measures for each block.
+  Using all of this data, I fit a gradient boosting machine (gbm) with a maximum of 500 trees, interaction depth of 12, and shrinkage factor of 0.1. Using four-fold cross validation, I measured the out-of-sample performance of each potential number of trees, and found the best model at 474 trees. I also initialized five additional models for comparison, where each has left out one of the sets of explanatory variables.
+```{r, warning = FALSE, echo=FALSE}
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(count/ALAND20)), color = NA)+
+  scico::scale_fill_scico(palette = "lajolla")+
+  labs(title = "True Crime Rate by Census Block", 
+       fill = "logged Crime Rate",
+       tag = "Figure 1")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+```
+
+## Results
+
+  For the full model, I found an out-of-sample RMSE of 0.0026/20. This RMSE translates to a an average error of approximately 0.05% compared to the average property crime rate per square meter per year of 0.0055/20, and an approximate increase in out-of-sample accuracy of 1,500% over a linear model initialized with the same variables (RMSE of 0.0047/20). See figure 1 below for the map of the models predictions and figure 2 below for the map of the residual error between the predictions and true values. 
+```{r, warning = FALSE, echo=FALSE}
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(pred)), color = NA)+
+  labs(title = "Predicted Crime Rate by Census Block", 
+       fill = "Logged Predictions",
+       tag = "Figure 2")+
+  scico::scale_fill_scico(palette = "lajolla")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(predErr)), color = NA)+
+  labs(title = "Primary Model Residuals",
+       fill = "Logged Difference",
+       tag = "Figure 3")+
+  scico::scale_fill_scico(palette = "lajolla")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+```
+  I was also interested in measuring the relative importance of each variable in the model, which you can see in table 1 below. Note that the measures of steepness and property value are separated out into multiple sub variables in this chart, so to understand the actual influence of those data sets, we have to consider the related variables as if they were one. The advantage of not having these variables combined is that we are now able to see how the different methods of measuring these categories compare. It is interesting to notice that the land values from property tax assessments ("meanLandValue") were much better than the census estimate of housing values ("estimate"), but that the total measure of property tax assessments ("meanTotalValue") were rather lackluster. The steepness measures are rather lackluster in general, but we can see that the mean appears to underperform here relatively speaking.
+```{r, include=FALSE}
+library(gbm)
+sum <- summary.gbm(boost, n.trees = 474)
+sum <- sum%>%
+  mutate("Relative Influence" = rel.inf, rel.inf = NULL, var = NULL)
+```
+```{r, warning = FALSE, echo=FALSE}
+library(knitr)
+kable(sum, caption = "Table 1: The relative influence of each variable in the main model")
+```
+  My final visualization step was to create maps that showcase the difference in predictions between the main model and a model that leaves out one of the variable groups. Figure 3 below, the prediction differences between the full model and a model without information on proximity to police stations, is the most striking of these. We can see very clear rings of higher differences around several of the marked police stations (the farthest west police station, for instance). I at first wondered if the strength of police station proximity in the predictions might have sprung from an abundance of filed reports, rather than a lack of crime, but the coefficient in the linear model on police station proximity is negative, so it seems that the expected mechanism is likely in evidence. The other partial maps can be seen in figures a.4, a.5, a.6 and a.7 in the appendix.
+```{r, warning = FALSE, echo=FALSE}
+ggplot()+
+  geom_sf(data = adjBlocks, aes(fill = log(policeDiff)), color = NA)+
+  geom_point(data = policeStation, aes(x = longitude, y = latitude), color = "green")+
+  scico::scale_fill_scico(palette = "lajolla")+
+  labs(title = "Difference in Predictions when Excluding\nPolice Station Data", 
+       subtitle = "Locations of police stations marked in green",
+       fill = "Logged Difference",
+       tag = "Figure 3")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+```
+
+## Conclusion
+
+  Even with such a small set of variables, I was able to create a very accurate model for predicting property crime rates in San Francisco. It appears that property value is the largest predictor (when considering all the variables for property value that were included), which is not surprising. I was disappointed to see that my measures for steepness had such low predictive power, however I believe that this is because absolute elevation ended up accounting for the effect that I was expecting to measure through approximate street grade: people don't like to walk up hill, so higher elevations see less property crime.
+  
+## Appendix
+```{r, warning = FALSE, echo=FALSE}
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = estimate), color = NA)+
+  labs(title = "Median Housing Value by Census Block Group", 
+       fill = "Reported Median\nHousing Value",
+       tag = "Figure a.1")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(meanLandValue)), color = NA)+
+  labs(title = "Mean Land Value by Census Block", 
+       fill = "Logged Average\nLand Value",
+       tag = "Figure a.2")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(meanTotalValue)), color = NA)+
+  labs(title = "Property Value by Census Block", 
+       fill = "Logged Average\nProperty Value",
+       tag = "Figure a.3")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(busDiff)), color = NA)+
+  geom_point(data = busStops, aes(x = LONGITUDE, y = LATITUDE), color = "green", alpha = 0.25, size = 0.5)+
+  labs(title = "Difference in Predictions when Excluding\nBus Stop Data",
+       x = "", y = "",
+       subtitle = "Locations of bus stops marked in green",
+       fill = "Logged Difference",
+       tag = "Figure a.4")+
+  scico::scale_fill_scico(palette = "lajolla")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(elevDiff)), color = NA)+
+  scico::scale_fill_scico(palette = "lajolla")+
+  labs(title = "Difference in Predictions when Excluding\nElevation Data",
+       fill = "Logged Difference",
+       tag = "Figure a.5")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(elev_gradeDiff)), color = NA)+
+  labs(title = "Difference in Predictions when Excluding\nElevation and Grade Data",
+       fill = "Logged Difference",
+       tag = "Figure a.6")+
+  scico::scale_fill_scico(palette = "lajolla")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+ggplot(adjBlocks)+
+  geom_sf(aes(fill = log(priceDiff)), color = NA)+
+  labs(title = "Difference in Predictions when Excluding\nProperty Value Data",
+       fill = "Logged Difference",
+       tag = "Figure a.7")+
+  scico::scale_fill_scico(palette = "lajolla")+
+  xlim(-122.52, -122.362)+
+  ylim(37.712, 37.81)
+```
